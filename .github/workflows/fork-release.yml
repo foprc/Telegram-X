@@ -1,0 +1,161 @@
+name: Fork release
+
+on:
+  push:
+    tags: ['fork-v*']
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: 'Increasing fork build number (e.g. 1833)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'foprc/Telegram-X'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+    env:
+      TERM: xterm
+    steps:
+      - name: Reserve disk space for recursive sources and native builds
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          lfs: true
+          persist-credentials: false
+      - name: Validate release version and credentials
+        id: version
+        env:
+          INPUT_BUILD: ${{ inputs.build_number }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess
+          names = ('TELEGRAM_API_ID', 'TELEGRAM_API_HASH', 'RELEASE_KEYSTORE_BASE64',
+                   'RELEASE_STORE_PASSWORD', 'RELEASE_KEY_ALIAS', 'RELEASE_KEY_PASSWORD')
+          missing = [n for n in names if not os.environ.get(n)]
+          if missing:
+              raise SystemExit('Set repository Secrets first: ' + ', '.join(missing))
+          build = (os.environ['GITHUB_REF_NAME'].removeprefix('fork-v')
+                   if os.environ['GITHUB_REF_TYPE'] == 'tag' else os.environ['INPUT_BUILD'])
+          if not re.fullmatch(r'[1-9][0-9]{0,5}', build):
+              raise SystemExit('Use tag fork-v<build number> or a positive build_number (max six digits)')
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'FORK_BUILD_NUMBER={build}\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'tag=fork-v{build}\n')
+              f.write('commit=' + subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '15859902'
+      - name: Install native build tools and Android packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build autoconf automake libtool pkg-config nasm yasm
+          sdk_package=$(scripts/read-property.sh version.properties version.sdk_package)
+          build_tools=$(scripts/read-property.sh version.properties version.build_tools)
+          ndk=$(scripts/read-property.sh version.properties version.ndk_primary)
+          cmake=$(scripts/read-property.sh version.properties version.cmake)
+          sdkmanager "platforms;$sdk_package" "build-tools;$build_tools" "ndk;$ndk" "cmake;$cmake"
+          scripts/setup-rust.sh
+          echo "FORK_RUST_HOME=$(rustup show home)" >> "$GITHUB_ENV"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Configure signed build
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: python3 scripts/fork/configure-release.py
+      - name: Test and build arm64 release APK
+        run: |
+          ./gradlew :app:validateGitSetup :app:testLatestDebugUnitTest --tests org.thunderdog.challegram.navigation.DualPaneLayoutTest -Pabi=arm64 --console=plain
+          ./gradlew :app:assembleLatestRelease -Pabi=arm64 --console=plain
+      - name: Verify and collect download assets
+        run: |
+          mkdir -p release-assets
+          build_tools=$(scripts/read-property.sh version.properties version.build_tools)
+          count=0
+          while IFS= read -r -d '' apk; do
+            "$ANDROID_SDK_ROOT/build-tools/$build_tools/apksigner" verify --verbose "$apk"
+            cp "$apk" release-assets/
+            count=$((count + 1))
+          done < <(find app/build/outputs/apk/latest/release -name '*.apk' -print0)
+          test "$count" -gt 0
+          (cd release-assets && sha256sum ./*.apk > SHA256SUMS.txt)
+          cat > release-assets/RELEASE_NOTES.md <<EOF
+          Telegram X Dual — unofficial fork with adaptive dual-pane navigation.
+
+          - Package: io.github.foprc.telegramx (installs alongside the official app)
+          - Architecture: arm64-v8a; latest Android flavor
+          - Firebase push notifications are disabled in this preview.
+          - UI behavior on physical devices still needs validation.
+          - Build: $FORK_BUILD_NUMBER
+          - Source: https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA
+
+          Install the APK below. SHA256SUMS.txt contains download checksums.
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fork-release-assets
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove signing material
+        if: always()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          Path('local.properties').unlink(missing_ok=True)
+          shutil.rmtree('release-private', ignore_errors=True)
+          PY
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fork-release-assets
+          path: release-assets
+      - name: Create prerelease draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/*.apk release-assets/SHA256SUMS.txt \
+            --target "$RELEASE_COMMIT" --draft --prerelease \
+            --title "Telegram X Dual $RELEASE_TAG (arm64 preview)" \
+            --notes-file release-assets/RELEASE_NOTES.md
